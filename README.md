@@ -6,7 +6,7 @@ Macromolecular docking is a massive computationally expensive search problem. Th
 
 ---
 
-## 📂 Repository Structure & Navigation
+## Repository Structure & Navigation
 
 This repository is organized into distinct modules separating data management, visualization, the core docking algorithm, and literature.
 
