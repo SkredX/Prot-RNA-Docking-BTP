@@ -1,31 +1,15 @@
 """
-Phase 4 — FFT Correlation Docking
+Phase 4 — FFT Correlation Docking (GPU Accelerated)
 ===================================
-Executes the core FFT-based shape complementarity search.
-
-Algorithm:
-    1. Define a common bounding box large enough to hold the Protein
-       and the rotating RNA without circular wrap-around artifacts.
-    2. Voxelize the fixed Protein (Receptor).
-    3. Loop over SO(3) rotations:
-        a. Rotate the RNA.
-        b. Voxelize the rotated RNA (Ligand).
-        c. Compute cross-correlation via FFT:
-           score = IFFT( FFT(Protein) * conj(FFT(RNA)) )
-        d. Find the translation (ix, iy, iz) that maximizes the score.
-    4. Save the top-scoring pose for each rotation.
-
-Standard Complementarity:
-    Protein Grid: Surface = +1, Interior = -15, Empty = 0
-    RNA Grid    : Surface/Interior = +1, Empty = 0
-    (This ensures surface-surface overlap is positive, while clashes 
-    with the protein interior generate massive negative penalties).
+Executes the core FFT-based shape complementarity search using PyTorch 
+to push grid arrays to the GPU, massively accelerating computation.
 """
 
 import math
 import time
 import numpy as np
 import argparse
+import torch
 from typing import List, Tuple, Dict
 from dataclasses import dataclass
 
@@ -57,19 +41,12 @@ class CommonGridManager:
         self.builder = GridBuilder(resolution=resolution, padding=padding)
 
     def determine_common_shape(self, pro_coords: np.ndarray, rna_coords: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int]]:
-        """
-        Calculates a bounding box that can contain the protein AND the RNA 
-        orbiting around it.
-        """
-        # Get absolute bounds of protein
         p_min = pro_coords.min(axis=0)
         p_max = pro_coords.max(axis=0)
         
-        # Max radius the RNA could sweep out if it orbits the protein
         rna_center = rna_coords.mean(axis=0)
         rna_max_dist = np.max(np.linalg.norm(rna_coords - rna_center, axis=1))
         
-        # The common grid must hold the protein plus enough room for RNA to translate around it
         lo = p_min - rna_max_dist - self.padding
         hi = p_max + rna_max_dist + self.padding
         
@@ -78,8 +55,6 @@ class CommonGridManager:
         return origin, dims
 
     def build_protein_grid(self, struct: Structure, origin: np.ndarray, dims: Tuple[int, int, int]) -> np.ndarray:
-        """Builds the static protein grid in the common box."""
-        # Override the builder's dynamic dims to force our common dims
         atoms = self.builder._collect_atoms(struct, "protein")
         coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
         from grid3d import get_vdw_radius
@@ -89,21 +64,17 @@ class CommonGridManager:
         return grid
 
     def build_rna_grid(self, struct: Structure, origin: np.ndarray, dims: Tuple[int, int, int], current_coords: np.ndarray) -> np.ndarray:
-        """Builds the RNA grid and flattens it so interior and surface are both +1."""
         atoms = self.builder._collect_atoms(struct, "rna")
         from grid3d import get_vdw_radius
         radii = np.array([get_vdw_radius(a) for a in atoms], dtype=np.float64)
         
         grid = self.builder._build_shape_grid(current_coords, radii, origin, dims)
-        
-        # Modify Ligand grid for cross-correlation: 
-        # Anything that belongs to the RNA (surface or interior) becomes 1.0
         ligand_grid = np.where(grid != 0, 1.0, 0.0).astype(np.float32)
         return ligand_grid
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Core FFT Docking Engine
+# Core FFT Docking Engine (GPU Enabled)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class FFTDocker:
@@ -111,12 +82,16 @@ class FFTDocker:
         self.resolution = resolution
         self.sampler = SO3Sampler(angular_step_deg=angular_step)
         self.grid_manager = CommonGridManager(resolution=resolution)
+        
+        # 1. Initialize PyTorch Device
+        # Automatically detects an Nvidia GPU. Falls back to CPU if none is found.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"\n[Hardware Initialization] FFTDocker using device: {self.device.type.upper()}")
 
     def dock(self, case) -> List[DockingResult]:
-        print(f"\n[{case.complex_id}] Starting FFT Docking...")
+        print(f"\n[{case.complex_id}] Starting GPU-Accelerated FFT Docking...")
         start_time = time.time()
 
-        # 1. Extract raw coordinates
         pro_atoms = self.grid_manager.builder._collect_atoms(case.protein_struct, "protein")
         pro_coords = np.array([[a.x, a.y, a.z] for a in pro_atoms])
         
@@ -124,45 +99,55 @@ class FFTDocker:
         rna_coords = np.array([[a.x, a.y, a.z] for a in rna_atoms])
         rna_center = rna_coords.mean(axis=0)
 
-        # 2. Determine common grid bounding box
         origin, dims = self.grid_manager.determine_common_shape(pro_coords, rna_coords)
         print(f"  Common Grid Shape : {dims}")
-        print(f"  Grid Origin       : {origin}")
 
-        # 3. Build and pre-transform the static Protein Grid
         print("  Building fixed protein grid...")
         pro_grid = self.grid_manager.build_protein_grid(case.protein_struct, origin, dims)
-        fft_pro = np.fft.fftn(pro_grid)
+        
+        # 2. Push Protein Grid to GPU and perform initial FFT
+        pro_tensor = torch.tensor(pro_grid, dtype=torch.float32, device=self.device)
+        fft_pro = torch.fft.fftn(pro_tensor)
 
         results = []
         n_rots = self.sampler.n_rotations
 
         print(f"  Evaluating {n_rots} rotations...")
         
-        # 4. Loop over all rotations
         for i, R in enumerate(self.sampler):
             if i > 0 and i % 50 == 0:
                 print(f"    Processed {i}/{n_rots} rotations...")
 
-            # Rotate RNA around its own center
+            # Rotate RNA around its own center (Runs on CPU - very fast)
             rot_rna_coords = rotate_coords(rna_coords, R, rna_center)
 
-            # Build RNA grid
+            # Build RNA grid (Runs on CPU)
             rna_grid = self.grid_manager.build_rna_grid(case.rna_struct, origin, dims, rot_rna_coords)
             
-            # FFT of RNA
-            fft_rna = np.fft.fftn(rna_grid)
-
+            # ──────────────────────────────────────────────────────────
+            # GPU ACCELERATION BLOCK START
+            # ──────────────────────────────────────────────────────────
+            
+            # Push dynamic RNA grid to GPU
+            rna_tensor = torch.tensor(rna_grid, dtype=torch.float32, device=self.device)
+            
+            # Execute FFTs entirely in GPU memory
+            fft_rna = torch.fft.fftn(rna_tensor)
+            
             # Cross-correlation: IFFT( FFT(P) * conj(FFT(R)) )
-            # We use standard cross-correlation equation here. 
-            corr_grid = np.real(np.fft.ifftn(fft_pro * np.conjugate(fft_rna)))
+            corr_tensor = torch.fft.ifftn(fft_pro * torch.conj(fft_rna)).real
+            
+            # Extract the max score and its flattened index directly from the GPU
+            best_idx_flat = torch.argmax(corr_tensor).item()
+            best_score = corr_tensor.flatten()[best_idx_flat].item()
+            
+            # Unravel the flat index back into 3D (x, y, z) using NumPy
+            best_idx = np.unravel_index(best_idx_flat, dims)
+            
+            # ──────────────────────────────────────────────────────────
+            # GPU ACCELERATION BLOCK END
+            # ──────────────────────────────────────────────────────────
 
-            # Find the grid voxel with the highest complementarity score
-            best_idx = np.unravel_index(np.argmax(corr_grid), corr_grid.shape)
-            best_score = corr_grid[best_idx]
-
-            # Convert voxel shift to physical translation vector in Angstroms
-            # Note: Because of how FFT wrap-around works, we must shift indices > N/2 to negative
             shift_x = best_idx[0] if best_idx[0] < dims[0]/2 else best_idx[0] - dims[0]
             shift_y = best_idx[1] if best_idx[1] < dims[1]/2 else best_idx[1] - dims[1]
             shift_z = best_idx[2] if best_idx[2] < dims[2]/2 else best_idx[2] - dims[2]
@@ -175,7 +160,6 @@ class FFTDocker:
                 translation_vector=translation_vector
             ))
 
-        # Sort results by best score descending
         results.sort(key=lambda x: x.score, reverse=True)
         
         elapsed = time.time() - start_time
@@ -192,25 +176,19 @@ class FFTDocker:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 4: FFT Correlation")
     
-    # Matching your exact Windows file paths
     parser.add_argument("--json",       default=r"D:\BTP Files\PRDBv3.0\PRDBv3_info.json")
     parser.add_argument("--pdb_root",   default=r"D:\BTP Files\PRDBv3.0")
     parser.add_argument("--step",       type=float, default=30.0, help="Angular step size (degrees)")
     parser.add_argument("--resolution", type=float, default=1.0, help="Grid voxel resolution")
     args = parser.parse_args()
 
-    # Load from Phase 1
     cases, skipped = load_uu_cases(args.json, args.pdb_root)
     if not cases:
         print("No cases loaded. Check paths.")
         exit()
 
-    # We will test on just the first case to avoid a long wait locally
     test_case = cases[0]
-    
-    # Initialize and run
     docker = FFTDocker(angular_step=args.step, resolution=args.resolution)
-    
     top_results = docker.dock(test_case)
     
     print("\nTop 5 Poses Found:")
