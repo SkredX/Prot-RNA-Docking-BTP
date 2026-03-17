@@ -1,6 +1,6 @@
 """
-Phase 1 — PDB Parser & Preprocessor
-=====================================
+Phase 1 — PDB Parser & Preprocessor  (phase1.py)
+=================================================
 Reads PRDBv3_info.json, filters UU docking cases, resolves PDB file paths
 from the folder structure, and parses protein + RNA chains from each PDB.
 
@@ -10,6 +10,8 @@ Folder structure assumed based on local setup:
             <C_PDB_ID>.pdb            ← bound complex
             <U_pro_PDB_ID>.pdb        ← unbound protein
             <U_RNA_PDB_ID>.pdb        ← unbound RNA
+
+Called by run.py — not normally executed directly.
 """
 
 import os
