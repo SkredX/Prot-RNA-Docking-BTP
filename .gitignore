@@ -1,0 +1,7 @@
+.venv
+PRDBv3.0
+venv
+assets/ALL_PDBs/**/complex_results
+assets/ALL_PDBs/**/unbound_results
+/**/generated_PDBS
+src/results

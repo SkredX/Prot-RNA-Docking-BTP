@@ -2,7 +2,7 @@
 
 **Rigid-body FFT-based Protein–RNA docking pipeline**  
 Global translational + rotational search using shape complementarity, GPU-accelerated via PyTorch.  
-Evaluated on the [PRDBv3](http://www.zlab.umassmed.edu/benchmark/) Unbound–Unbound (UU) benchmark dataset.
+Evaluated on the [PRDBv3](Kant S, Nithin C, Mukherjee S, Maity A, Bahadur RP. Protein-RNA Docking Benchmark v3.0 Integrated With Binding Affinity. Proteins. 2025 Sep;93(9):1534-1552. doi: 10.1002/prot.26825. Epub 2025 Apr 9. PMID: 40202108.) Unbound–Unbound (UU) benchmark dataset.
 
 ---
 
